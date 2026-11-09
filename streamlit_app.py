@@ -19,13 +19,6 @@ st.markdown("""
         background-color: #f8fafc;
         color: #1e293b;
     }
-    .main-card {
-        background: #ffffff;
-        padding: 20px;
-        border-radius: 14px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-        margin-bottom: 16px;
-    }
     .char-counter {
         font-weight: 600;
         font-size: 0.95rem;
@@ -84,80 +77,149 @@ def format_srt_time(seconds: float) -> str:
     if millis == 1000:
         secs += 1
         millis = 0
+        if secs == 60:
+            mins += 1
+            secs = 0
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
 
-def split_into_sentences(text: str) -> list:
-    """မြန်မာနှင့် အင်္ဂလိပ် စာကြောင်းများကို SRT အတွက် သဘာဝကျကျ ဖြတ်တောက်ခြင်း"""
+def has_speakable_text(text: str) -> bool:
+    """အသံထွက်နိုင်သော စာလုံး (မြန်မာ/အင်္ဂလိပ်/ဂဏန်း) ပါမပါ စစ်ဆေးခြင်း"""
+    # သင်္ကေတနှင့် Space များဖယ်ပြီး စာလုံးကျန်မကျန် စစ်သည်
+    cleaned = re.sub(r'[\s\W_]+', '', text, flags=re.UNICODE)
+    # မြန်မာသရ/ဗျည်း နှင့် အခြားစာလုံးများ ပါဝင်မှု စစ်ဆေးခြင်း
+    if cleaned or re.search(r'[\u1000-\u109F\uAA60-\uAA7F\w]', text):
+        # ပုဒ်မ (။)၊ ပုဒ်ဖြတ် (၊) သက်သက်သာ ဖြစ်နေလျှင် ပယ်ဖျက်မည်
+        only_stripped = re.sub(r'[။၊"\'“”‘’()\[\]{}.,!?;\-—_…\s]+', '', text)
+        return len(only_stripped) > 0
+    return False
+
+def clean_text_for_tts(text: str) -> str:
+    """Edge-TTS တွင် Error တက်စေသော အထူးသင်္ကေတများကို သန့်စင်ခြင်း"""
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = text.replace('<', ' ').replace('>', ' ').replace('&', ' and ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+def split_into_srt_lines(text: str) -> list:
+    """SRT စာတန်းထိုးအတွက် ဝါကျတိုများအဖြစ် သဘာဝကျကျ ခွဲထုတ်ခြင်း"""
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    chunks = []
+    sentences = []
     for line in raw_lines:
-        # မြန်မာပုဒ်မ (။)၊ ပုဒ်ဖြတ် (၊) နှင့် အင်္ဂလိပ် (. ! ? ;) တို့ဖြင့် ခွဲထုတ်ခြင်း
         parts = re.split(r'(?<=[။.!?])\s*|(?<=၊)\s+', line)
         for p in parts:
-            p = p.strip()
-            if not p:
+            p = clean_text_for_tts(p)
+            if not has_speakable_text(p):
                 continue
-            # စာကြောင်းအရမ်းရှည်ပါက စာလုံးရေ ၈၀ စီ ထပ်ခွဲပေးခြင်း
             if len(p) > 85:
                 sub_parts = [p[i:i+80].strip() for i in range(0, len(p), 80)]
-                chunks.extend([sp for sp in sub_parts if sp])
+                for sp in sub_parts:
+                    if has_speakable_text(sp):
+                        sentences.append(sp)
             else:
-                chunks.append(p)
-    return chunks
+                sentences.append(p)
+    return sentences
+
+def group_sentences_ into_batches(sentences: list, max_batch_chars: int = 450) -> list:
+    """
+    Request အရေအတွက် နည်းစေရန်နှင့် မြန်ဆန်စေရန် ဝါကျများကို အုပ်စုဖွဲ့ခြင်း (Batching)
+    """
+    batches = []
+    current_batch = []
+    current_len = 0
+
+    for s in sentences:
+        if current_len + len(s) > max_batch_chars and current_batch:
+            batches.append(current_batch)
+            current_batch = [s]
+            current_len = len(s)
+        else:
+            current_batch.append(s)
+            current_len += len(s)
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+async def fetch_audio_with_retry(text: str, voice: str, rate_str: str, pitch_str: str, retries: int = 3) -> bytes:
+    """NoAudioReceived မဖြစ်စေရန် Auto-Retry နှင့် Fallback ပါဝင်သော Function"""
+    for attempt in range(retries):
+        try:
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=voice,
+                rate=rate_str,
+                pitch=pitch_str
+            )
+            audio_data = bytearray()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_data.extend(chunk["data"])
+            if audio_data:
+                return bytes(audio_data)
+        except Exception:
+            if attempt < retries - 1:
+                await asyncio.sleep(0.8 * (attempt + 1))
+            else:
+                # နောက်ဆုံးအကြိမ်တွင် pitch/rate မပါဘဲ Default ဖြင့် ထပ်စမ်းပေးခြင်း
+                try:
+                    comm_fallback = edge_tts.Communicate(text=text, voice=voice)
+                    audio_data = bytearray()
+                    async for chunk in comm_fallback.stream():
+                        if chunk["type"] == "audio":
+                            audio_data.extend(chunk["data"])
+                    if audio_data:
+                        return bytes(audio_data)
+                except Exception:
+                    return b""
+    return b""
 
 async def generate_tts_and_srt(text: str, voice: str, speed_pct: int, pitch_pct: int, progress_bar):
-    """
-    ဝါကျအလိုက် အသံထုတ်ပြီး အသံအရှည်အတိအကျဖြင့် SRT Timestamp တွက်ချက်ပေးသည့် စနစ်
-    (မြန်မာအသံများတွင် WordBoundary မရသည့် ပြဿနာကို ၁၀၀% ဖြေရှင်းပေးသည်)
-    """
     rate_str = f"{speed_pct:+d}%"
-    # Edge-TTS သည် pitch ကို Hz ဖြင့် လက်ခံသဖြင့် UI မှ -100%..+100% ကို -100Hz..+100Hz သို့ တိုက်ရိုက်ချိတ်ဆက်ပေးထားသည်
     pitch_str = f"{pitch_pct:+d}Hz"
 
-    sentences = split_into_sentences(text)
+    sentences = split_into_srt_lines(text)
     if not sentences:
         return b"", ""
 
+    batches = group_sentences_into_batches(sentences, max_batch_chars=450)
     combined_audio = bytearray()
     srt_entries = []
     current_time = 0.0
-    total = len(sentences)
+    srt_index = 1
+    total_batches = len(batches)
 
-    for idx, sentence in enumerate(sentences, start=1):
-        communicate = edge_tts.Communicate(
-            text=sentence,
-            voice=voice,
-            rate=rate_str,
-            pitch=pitch_str
-        )
+    for b_idx, batch_sentences in enumerate(batches, start=1):
+        batch_text = " ".join(batch_sentences)
+        batch_audio = await fetch_audio_with_retry(batch_text, voice, rate_str, pitch_str)
 
-        sentence_audio = bytearray()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                sentence_audio.extend(chunk["data"])
-
-        # အသံဖိုင်၏ ကြာချိန်အတိအကျကို Mutagen ဖြင့် တိုင်းတာခြင်း
-        duration = 0.0
-        if sentence_audio:
+        if batch_audio:
             try:
-                audio_io = io.BytesIO(bytes(sentence_audio))
+                audio_io = io.BytesIO(batch_audio)
                 mp3_info = MP3(audio_io)
-                duration = mp3_info.info.length
+                batch_duration = mp3_info.info.length
             except Exception:
-                # အကယ်၍ header ဖတ်မရပါက စာလုံးအရေအတွက်ဖြင့် ခန့်မှန်းချိန်တွက်ခြင်း
-                duration = max(1.2, len(sentence) * 0.12)
+                batch_duration = max(1.5, len(batch_text) * 0.11)
 
-            combined_audio.extend(sentence_audio)
+            combined_audio.extend(batch_audio)
 
-            start_ts = format_srt_time(current_time)
-            end_ts = format_srt_time(current_time + duration)
-            srt_entries.append(f"{idx}\n{start_ts} --> {end_ts}\n{sentence}\n")
-            current_time += duration
+            # Batch အတွင်းရှိ ဝါကျတစ်ခုချင်းစီ၏ စာလုံးအချိုးအစားအလိုက် SRT အချိန်ကို အတိအကျ ခွဲဝေပေးခြင်း
+            total_Batch_chars = sum(max(1, len(s)) for s in batch_sentences)
+            for s in batch_sentences:
+                weight = max(1, len(s)) / total_Batch_chars
+                s_duration = batch_duration * weight
+                start_ts = format_srt_time(current_time)
+                end_ts = format_srt_time(current_time + s_duration)
+                srt_entries.append(f"{srt_index}\n{start_ts} --> {end_ts}\n{s}\n")
+                current_time += s_duration
+                srt_index += 1
 
-        progress_bar.progress(idx / total, text=f"အသံနှင့် SRT ထုတ်နေပါသည်... ({idx}/{total})")
+        progress_bar.progress(
+            b_idx / total_batches,
+            text=f"အသံနှင့် SRT ထုတ်နေပါသည်... ({int((b_idx / total_batches) * 100)}%)"
+        )
+        # Server Rate-limit မထိစေရန် ခေတ္တနားပေးခြင်း
+        await asyncio.sleep(0.15)
 
-    srt_content = "\n".join(srt_entries)
-    return bytes(combined_audio), srt_content
+    return bytes(combined_audio), "\n".join(srt_entries)
 
 # --- UI Controls ---
 with st.container():
@@ -214,9 +276,9 @@ if st.button("🚀 အသံဖိုင် (MP3) နှင့် SRT ထုတ�
     elif char_count > MAX_CHARS:
         st.error(f"စာလုံးရေ {MAX_CHARS:,} ထက် ကျော်လွန်နေပါသည်။ စာသားအချို့ လျှော့ချပေးပါ။")
     else:
-        # Edge-TTS တွင် -100% အတိအကျပို့လျှင် API Error တက်တတ်သဖြင့် -99% သို့ အလိုအလျောက် ညှိပေးထားသည်
-        safe_speed = -99 if speed_val == -100 else speed_val
-        safe_pitch = -99 if pitch_val == -100 else pitch_val
+        # Edge-TTS သည် -90% အောက် သို့မဟုတ် ±100% တွင် NoAudioReceived ပြတတ်သဖြင့် Safe Range သို့ ထိန်းပေးထားသည်
+        safe_speed = max(-90, min(100, speed_val))
+        safe_pitch = max(-90, min(100, pitch_val))
 
         progress = st.progress(0, text="စတင်နေပါသည်...")
         try:
@@ -236,7 +298,7 @@ if st.button("🚀 အသံဖိုင် (MP3) နှင့် SRT ထုတ�
                 st.session_state["tts_srt"] = srt_text
                 st.success("✅ အသံဖိုင်နှင့် SRT Subtitle ဖိုင် ထုတ်ပြီးပါပြီ!")
             else:
-                st.error("အသံထုတ်ရာတွင် အမှားအယွင်းရှိနေပါသည်။ စာသားပြန်စစ်ပေးပါ။")
+                st.error("အသံထုတ်မရပါ။ Streamlit Cloud မှ Reboot App လုပ်ပြီး ပြန်စမ်းကြည့်ပါ။")
         except Exception as e:
             progress.empty()
             st.error(f"Error ဖြစ်ပွားပါသည်: {e}")

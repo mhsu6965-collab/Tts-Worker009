@@ -84,11 +84,8 @@ def format_srt_time(seconds: float) -> str:
 
 def has_speakable_text(text: str) -> bool:
     """အသံထွက်နိုင်သော စာလုံး (မြန်မာ/အင်္ဂလိပ်/ဂဏန်း) ပါမပါ စစ်ဆေးခြင်း"""
-    # သင်္ကေတနှင့် Space များဖယ်ပြီး စာလုံးကျန်မကျန် စစ်သည်
     cleaned = re.sub(r'[\s\W_]+', '', text, flags=re.UNICODE)
-    # မြန်မာသရ/ဗျည်း နှင့် အခြားစာလုံးများ ပါဝင်မှု စစ်ဆေးခြင်း
     if cleaned or re.search(r'[\u1000-\u109F\uAA60-\uAA7F\w]', text):
-        # ပုဒ်မ (။)၊ ပုဒ်ဖြတ် (၊) သက်သက်သာ ဖြစ်နေလျှင် ပယ်ဖျက်မည်
         only_stripped = re.sub(r'[။၊"\'“”‘’()\[\]{}.,!?;\-—_…\s]+', '', text)
         return len(only_stripped) > 0
     return False
@@ -118,10 +115,8 @@ def split_into_srt_lines(text: str) -> list:
                 sentences.append(p)
     return sentences
 
-def group_sentences_ into_batches(sentences: list, max_batch_chars: int = 450) -> list:
-    """
-    Request အရေအတွက် နည်းစေရန်နှင့် မြန်ဆန်စေရန် ဝါကျများကို အုပ်စုဖွဲ့ခြင်း (Batching)
-    """
+def group_sentences_into_batches(sentences: list, max_batch_chars: int = 450) -> list:
+    """Request အရေအတွက် နည်းစေရန်နှင့် မြန်ဆန်စေရန် ဝါကျများကို အုပ်စုဖွဲ့ခြင်း"""
     batches = []
     current_batch = []
     current_len = 0
@@ -159,7 +154,6 @@ async def fetch_audio_with_retry(text: str, voice: str, rate_str: str, pitch_str
             if attempt < retries - 1:
                 await asyncio.sleep(0.8 * (attempt + 1))
             else:
-                # နောက်ဆုံးအကြိမ်တွင် pitch/rate မပါဘဲ Default ဖြင့် ထပ်စမ်းပေးခြင်း
                 try:
                     comm_fallback = edge_tts.Communicate(text=text, voice=voice)
                     audio_data = bytearray()
@@ -201,10 +195,9 @@ async def generate_tts_and_srt(text: str, voice: str, speed_pct: int, pitch_pct:
 
             combined_audio.extend(batch_audio)
 
-            # Batch အတွင်းရှိ ဝါကျတစ်ခုချင်းစီ၏ စာလုံးအချိုးအစားအလိုက် SRT အချိန်ကို အတိအကျ ခွဲဝေပေးခြင်း
-            total_Batch_chars = sum(max(1, len(s)) for s in batch_sentences)
+            total_batch_chars = sum(max(1, len(s)) for s in batch_sentences)
             for s in batch_sentences:
-                weight = max(1, len(s)) / total_Batch_chars
+                weight = max(1, len(s)) / total_batch_chars
                 s_duration = batch_duration * weight
                 start_ts = format_srt_time(current_time)
                 end_ts = format_srt_time(current_time + s_duration)
@@ -216,7 +209,6 @@ async def generate_tts_and_srt(text: str, voice: str, speed_pct: int, pitch_pct:
             b_idx / total_batches,
             text=f"အသံနှင့် SRT ထုတ်နေပါသည်... ({int((b_idx / total_batches) * 100)}%)"
         )
-        # Server Rate-limit မထိစေရန် ခေတ္တနားပေးခြင်း
         await asyncio.sleep(0.15)
 
     return bytes(combined_audio), "\n".join(srt_entries)
@@ -276,7 +268,6 @@ if st.button("🚀 အသံဖိုင် (MP3) နှင့် SRT ထုတ�
     elif char_count > MAX_CHARS:
         st.error(f"စာလုံးရေ {MAX_CHARS:,} ထက် ကျော်လွန်နေပါသည်။ စာသားအချို့ လျှော့ချပေးပါ။")
     else:
-        # Edge-TTS သည် -90% အောက် သို့မဟုတ် ±100% တွင် NoAudioReceived ပြတတ်သဖြင့် Safe Range သို့ ထိန်းပေးထားသည်
         safe_speed = max(-90, min(100, speed_val))
         safe_pitch = max(-90, min(100, pitch_val))
 
